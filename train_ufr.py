@@ -27,11 +27,17 @@ from metrics import (
     analyze_model_structure
 )
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# Try flash attention, fallback to standard
+try:
+    from kernels import get_kernel
+    cap = torch.cuda.get_device_capability()
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
+    USE_FLASH = True
+except Exception as e:
+    print(f"Flash attention not available ({e}), using standard attention")
+    fa3 = None
+    USE_FLASH = False
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -100,8 +106,24 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
+        if USE_FLASH:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            # Standard PyTorch attention fallback
+            # q: [B, T, n_head, head_dim], need [B, n_head, T, head_dim]
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # Causal mask
+            T = scores.size(-1)
+            mask = torch.triu(torch.ones(T, T, device=scores.device), diagonal=1).bool()
+            scores = scores.masked_fill(mask, float('-inf'))
+            attn = F.softmax(scores, dim=-1)
+            y = torch.matmul(attn, v)
+            y = y.transpose(1, 2).contiguous()
+        
+        y = y.view(B, T, -1)
         y = self.c_proj(y)
         return y
 
